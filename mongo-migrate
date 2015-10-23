@@ -1,0 +1,149 @@
+#!/usr/bin/python
+
+import os, argparse, json, time, codecs, re, sys
+from pymongo import MongoClient
+
+
+def main():
+
+    (cw, ch) = getTerminalSize()
+
+
+    # define arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c", "--config", nargs="?", default="./migrate.json", help="configuration file (default: ./migrate.json)")
+    parser.add_argument("command", choices=("add", "migrate", "rollback"), help="action to perform")
+    parser.add_argument("name", help="name of the migration", nargs="?")
+
+    args = parser.parse_args();
+
+    # parse config file to extract the serverUrl variable
+    with open(args.config) as data_file:    
+        data = json.load(data_file)
+    
+    # create migration folder
+    if not os.path.exists(data["migrationFolder"]):
+        os.makedirs(data["migrationFolder"])
+
+    client = MongoClient(data["serverUrl"])
+    db = client[data["database"]]
+    collection = db[data["collection"]]
+    # get last migration in collection
+    if args.command == "add":
+        try:
+            if len([f for f in os.listdir(data["migrationFolder"]) if re.match(r'[0-9]{14}\-'+args.name+'\.js$', f)]) > 0:
+                print "%*s %6s" % (-(cw-11),"There is already a migration with name: " + args.name , "[ \033[91mFAILED\033[0m ]")
+                quit()
+            print "%*s %6s" % (-(cw-11),"Creating new migration: " + args.name, "[   \033[92mOK\033[0m   ]")
+            # get filename
+            filename = time.strftime("%Y%m%d%H%M%S") + "-" + args.name + ".js"
+            # create the template in the migration folder
+            f = codecs.open(os.path.join(data["migrationFolder"],filename), "w", "utf-8")
+            f.write("// #up\nfunction(){\n\t\n}\n// # /up\n\n// # down\nfunction(){\n\t\n}\n// # /down\n")
+            f.close()
+        except Exception as e:
+            print "%*s %6s" % (-(cw-11),"Creating new migration: " + args.name + " failed: " + str(sys.exc_info()[0]), "[ \033[91mFAILED\033[0m ]")
+            raise # reraises the exception
+
+    elif args.command == "migrate":
+        try:
+            # list all migrations
+            migrations = [f for f in os.listdir(data["migrationFolder"]) if re.match(r'^[0-9]{14}\-.*\.js$', f)]
+
+            # get last applied migration
+            last_migration = collection.find_one(sort=[("name", -1)])
+
+            # filter list
+            if last_migration != None:
+                migrations = [f for f in migrations if f > last_migration[u'file']]
+
+            if args.name != None:
+                # get migration with name
+                m = [f for f in migrations if re.match(r'[0-9]{14}\-'+args.name+'\.js$', f)]
+                if len(m) > 0:
+                    print "%*s %6s" % (-(cw-11),"Migrations only up to " + m[0], "[  \033[93mWARN\033[0m  ]")
+                    migrations = [f for f in migrations if f <= m[0]]
+
+            if len(migrations) == 0:
+                print "%*s %6s" % (-(cw-11),"All migrations were already applied", "[   \033[92mOK\033[0m   ]")
+            else:
+                for m in migrations:
+                    apply_migration(db, data["migrationFolder"], m, "up")
+                    name = re.match(r'^[0-9]*\-(.*).js$', m).group(1)
+                    collection.insert_one({"name" : name, "file": m})
+                    print "%*s %6s" % (-(cw-11),"Applied migration " + m, "[   \033[92mOK\033[0m   ]")
+
+        except Exception as e:
+            print "%*s %6s" % (-(cw-11),"Migrating failed: " + str(sys.exc_info()[0]), "[ \033[91mFAILED\033[0m ]")
+            raise # reraises the exception
+
+    else: #command == "rollback"
+        if args.name == None:
+            print "%*s %6s" % (-(cw-11),"Nothing to rollback", "[  \033[93mWARN\033[0m  ]")
+            quit()
+        try:
+            # get migrations to rollback
+            t = collection.find_one({"name":args.name})
+
+            if t == None:
+                print "%*s %6s" % (-(cw-11),"Nothing to rollback", "[  \033[93mWARN\033[0m  ]")
+                quit()
+
+            migrations = list(collection.find({"file" : {"$gte" : t[u'file']}}).sort("file", -1))
+
+            for m in migrations:
+                f = m[u'file']
+                apply_migration(db, data["migrationFolder"], f, "down")
+                collection.delete_one({"file": f})
+                print "%*s %6s" % (-(cw-11),"Rollback " + f, "[   \033[92mOK\033[0m   ]")
+
+        except Exception as e:
+            print "%*s %6s" % (-(cw-11),"Rollback failed: " + str(sys.exc_info()[0]), "[ \033[91mFAILED\033[0m ]")
+            raise # reraises the exception
+
+
+def apply_migration(db, folder, file, direction):
+    # read file
+    f = codecs.open(os.path.join(folder, file), "r", "utf-8")
+    content = f.read().decode('utf8')
+    f.close()
+    # extract part
+    m = re.match(".*//\s*#" + direction + "\n*\s*(.*?)\s*\n*//\s*#/" + direction + ".*", content, re.DOTALL)
+    if m:
+        function = m.group(1)
+        db.eval(function)
+    else:
+        print "no " + direction
+
+#from: http://stackoverflow.com/questions/566746/how-to-get-console-window-width-in-python
+def getTerminalSize():
+    import os
+    env = os.environ
+    def ioctl_GWINSZ(fd):
+        try:
+            import fcntl, termios, struct, os
+            cr = struct.unpack('hh', fcntl.ioctl(fd, termios.TIOCGWINSZ,
+        '1234'))
+        except:
+            return
+        return cr
+    cr = ioctl_GWINSZ(0) or ioctl_GWINSZ(1) or ioctl_GWINSZ(2)
+    if not cr:
+        try:
+            fd = os.open(os.ctermid(), os.O_RDONLY)
+            cr = ioctl_GWINSZ(fd)
+            os.close(fd)
+        except:
+            pass
+    if not cr:
+        cr = (env.get('LINES', 25), env.get('COLUMNS', 80))
+
+        ### Use get(key[, default]) instead of a try/catch
+        #try:
+        #    cr = (env['LINES'], env['COLUMNS'])
+        #except:
+        #    cr = (25, 80)
+    return int(cr[1]), int(cr[0])
+
+if __name__ == "__main__":
+    main()

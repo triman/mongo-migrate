@@ -1,0 +1,6 @@
+{
+	"serverUrl" : "mongodb://localhost:27017",
+	"migrationFolder" : "migrations",
+	"collection" : "migrations",
+	"database" : "test"
+}
